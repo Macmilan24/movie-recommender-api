@@ -1,6 +1,4 @@
 # movie_recommender_api.py
-# A free API for movie recommendations using FastAPI and DistilBERT with JSON input
-
 import numpy as np
 from transformers import DistilBertTokenizer, DistilBertModel
 import torch
@@ -15,15 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
-# Set up NLTK (run once)
+# Download all required NLTK data
 nltk.download('punkt')
+nltk.download('punkt_tab')  # Added for tokenization
 nltk.download('stopwords')
 nltk.download('wordnet')
 
-# Create the FastAPI app
 app = FastAPI(title="Movie Recommender API")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://movie-recommender-tester.vercel.app"],
@@ -32,26 +29,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Define JSON input structures
 class UserEntry(BaseModel):
     user_id: int
     movie_id: int
-    rating: Optional[float] = None  # Rating can be missing or null
+    rating: Optional[float] = None
 
 class MovieEntry(BaseModel):
     movie_id: int
     title: str
     genres: str
 
-# Reusable functions
+class RecommendRequest(BaseModel):
+    user_id: int
+    user_data: List[UserEntry]
+    movie_data: List[MovieEntry]
+
 def setup_distilbert():
-    """Load DistilBERT tools."""
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
     model = DistilBertModel.from_pretrained('distilbert-base-uncased')
     return tokenizer, model
 
 def preprocess_text(text):
-    """Clean text for DistilBERT."""
     text = text.replace('|', ' ')
     tokens = word_tokenize(text.lower())
     stop_words = set(stopwords.words('english'))
@@ -60,30 +58,26 @@ def preprocess_text(text):
     return ' '.join([lemmatizer.lemmatize(word) for word in cleaned])
 
 def get_embedding(text, tokenizer, model):
-    """Turn text into numbers."""
     inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=128)
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.last_hidden_state[:, 0, :].squeeze().numpy()
 
 def preprocess_movies(movie_data):
-    """Clean all movie texts."""
     movie_data['processed'] = (movie_data['title'] + ' ' + movie_data['genres']).apply(preprocess_text)
     return movie_data
 
 def precompute_movie_embeddings(movie_data, tokenizer, model):
-    """Make number piles for all movies."""
     embeddings = np.array([get_embedding(text, tokenizer, model) for text in movie_data['processed']])
     return embeddings, movie_data['movie_id'].tolist()
 
 def build_weighted_profile(user_id, user_data, movie_data, tokenizer, model):
-    """Make user's taste pile."""
     user_history = user_data[user_data['user_id'] == user_id]
     user_movies = pd.merge(user_history, movie_data, on='movie_id')
     if user_movies.empty:
         raise ValueError(f"No watch history for user {user_id}")
     embeddings = []
-    ratings = user_movies['rating'].fillna(3.0).tolist()  # Default 3.0 if no rating
+    ratings = user_movies['rating'].fillna(3.0).tolist()
     for text in user_movies['processed']:
         emb = get_embedding(text, tokenizer, model)
         embeddings.append(emb)
@@ -93,7 +87,6 @@ def build_weighted_profile(user_id, user_data, movie_data, tokenizer, model):
     return profile_emb, user_movies['movie_id'].tolist()
 
 def recommend_movies(user_id, user_data, movie_data, movie_embeddings, movie_ids, tokenizer, model, top_n=5):
-    """Find new movies."""
     profile_emb, watched_ids = build_weighted_profile(user_id, user_data, movie_data, tokenizer, model)
     unseen_mask = ~np.isin(movie_ids, watched_ids)
     unseen_embs = movie_embeddings[unseen_mask]
@@ -108,30 +101,19 @@ def recommend_movies(user_id, user_data, movie_data, movie_embeddings, movie_ids
     rec_df.insert(0, 'rank', range(1, len(rec_df) + 1))
     return rec_df.to_dict(orient='records')
 
-# API endpoint for JSON input
 @app.post("/recommend", response_model=List[dict])
-async def get_recommendations(user_id: int, user_data: List[UserEntry], movie_data: List[MovieEntry]):
-    """API to recommend movies from JSON data."""
+async def get_recommendations(request: RecommendRequest):
     try:
-        # Convert JSON to pandas DataFrames
-        user_df = pd.DataFrame([entry.dict() for entry in user_data])
-        movie_df = pd.DataFrame([entry.dict() for entry in movie_data])
-
-        # Load DistilBERT
+        user_df = pd.DataFrame([entry.dict() for entry in request.user_data])
+        movie_df = pd.DataFrame([entry.dict() for entry in request.movie_data])
         tokenizer, model = setup_distilbert()
-
-        # Preprocess and compute embeddings
         movie_df = preprocess_movies(movie_df)
         movie_embeddings, movie_ids = precompute_movie_embeddings(movie_df, tokenizer, model)
-
-        # Get recommendations
-        recs = recommend_movies(user_id, user_df, movie_df, movie_embeddings, movie_ids, tokenizer, model)
+        recs = recommend_movies(request.user_id, user_df, movie_df, movie_embeddings, movie_ids, tokenizer, model)
         return recs
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-# Run locally (for testing)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
